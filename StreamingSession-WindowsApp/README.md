@@ -33,27 +33,22 @@ Place the CloudXR server binaries in the same folder as your executable:
 ```
 bin/
 ├── Server/
-│   ├── releases/                    # CloudXR 6.0 binaries
-│   ├── CloudXrService.exe           # CloudXR service application
-│   └── NvStreamManager.exe          # NVIDIA Stream Manager
-├── NvStreamManagerClient.h          # NVIDIA API header file
-└── NvStreamManagerClient.dll        # NVIDIA API dll file
+│   ├── releases/6.x.x               # NVIDIA CloudXR 6.x runtime binaries                    
+│   ├── CloudXrService.exe           # NVIDIA Stream Manager CloudXR service application
+│   └── NvStreamManager.exe          # NVIDIA Stream Manager application
+│   └── cloudxr-runtime.yaml         # NVIDIA Stream Manager CloudXR ser
+├── NvStreamManagerClient.h          # NVIDIA Stream Manager API header from their SampleClient
+└── NvStreamManagerClient.dll        # NVIDIA Stream Manager DLL from their SampleClient
 ```
 
-NVIDIA provides these binaries separately.
+NVIDIA provides these binaries separately on NGC as two separate downloads:  [CloudXR Runtime](https://catalog.ngc.nvidia.com/orgs/nvidia/resources/cloudxr-runtime) and [CloudXR Stream Manager](https://catalog.ngc.nvidia.com/orgs/nvidia/resources/cloudxr-stream-manager?version=6.0.3). 
 
-## OpenXR Runtime Management
-
-The application automatically manages the OpenXR runtime selection using the `XR_RUNTIME_JSON` environment variable. This ensures that the application uses the CloudXR OpenXR runtime. The environment variable overrides any system-wide OpenXR runtime settings (registry) and ensures CloudXR is used.
 
 ### Important:
 
-To avoid conflicts, ensure only one CloudXR Runtime folder exists in `Server\releases\`.
+To avoid conflicts, ensure the CloudXR Runtime folder exists in `Server\releases\6.x.x` where the 6.x.x is modified to the version number of the runtime (e.g. `6.0.4`)
 
-If multiple CloudXR versions are present (e.g., both `CloudXR-6.0.2-Win64-sdk` and `CloudXR-6.0.3-Win64-sdk`), the application will:
-- Detect all `openxr_cloudxr.json` files
-- Log a warning
-- Use the first one found (which may not be the intended version)
+If multiple CloudXR versions are present (e.g., both `6.0.2` and `6.0.4`), the application will choose the highest version. 
 
 ## Building
 

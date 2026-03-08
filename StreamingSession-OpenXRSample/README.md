@@ -48,12 +48,21 @@ This sample uses the following OpenXR extensions:
 
 ## Running the Application
 
-### Immersive Mode (Default)
+## OpenXR Runtime Management
+
+The application automatically manages the OpenXR runtime selection using the `XR_RUNTIME_JSON` environment variable. This ensures that the application uses the CloudXR OpenXR runtime. The environment variable overrides any system-wide OpenXR runtime settings (registry) and ensures CloudXR is used.   Set this to the directory where your preferred CloudXR runtime folder is available. 
+
+### Example XR_RUNTIME_JSON setting 
+```bash
+set XR_RUNTIME_JSON=c:\github\StreamingSession\StreamingSession-WindowsApp\bin\Debug\Server\releases\6.0.4\openxr_cloudxr.json
+```
+
+### Running in Immersive Mode (Default)
 ```bash
 StreamingSession-OpenXRSample.exe
 ```
 
-### iOS Mode
+### Running in iOS Mode
 ```bash
 StreamingSession-OpenXRSample.exe -iOS
 ```
