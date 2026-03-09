@@ -48,13 +48,50 @@ struct swapchain_t {
 
 struct input_state_t {
 	XrActionSet actionSet;
-	XrAction    poseAction;
-	XrAction    selectAction;
-	XrPath      handSubactionPath[2];
-	XrSpace     handSpace[2];
-	XrPosef     handPose[2];
-	XrBool32    renderHand[2];
-	XrBool32    handSelect[2];
+
+	// Pose actions
+	XrAction    gripPoseAction;
+	XrAction    aimPoseAction;
+
+	// Analog actions (float)
+	XrAction    triggerValueAction;
+	XrAction    gripValueAction;
+	XrAction    triggerSensorAction; // PSVR2 l2_sensor/r2_sensor (trigger proximity)
+	XrAction    gripSensorAction;    // PSVR2 l1_sensor/r1_sensor (grip proximity)
+	XrAction    thumbstickXAction;
+	XrAction    thumbstickYAction;
+
+	// Boolean actions
+	XrAction    triggerTouchAction;
+	XrAction    thumbstickTouchAction;
+	XrAction    thumbstickClickAction;
+	XrAction    buttonAXAction;       // A (right hand) / X (left hand)
+	XrAction    buttonAXTouchAction;
+	XrAction    buttonBYAction;       // B (right hand) / Y (left hand)
+	XrAction    buttonBYTouchAction;
+	XrAction    menuClickAction;
+
+	XrPath      handSubactionPath[2]; // 0 = left, 1 = right
+	XrSpace     gripSpace[2];
+	XrSpace     aimSpace[2];
+
+	// Per-frame state (populated by openxr_input_update each frame)
+	XrPosef     gripPose[2];
+	bool        poseValid[2];
+	float       triggerValue[2];
+	bool        triggerTouched[2];
+	float       gripValue[2];
+	float       triggerSensor[2];
+	float       gripSensor[2];
+	float       thumbstickX[2];
+	float       thumbstickY[2];
+	bool        thumbstickTouched[2];
+	bool        thumbstickClicked[2];
+	bool        buttonAX[2];
+	bool        buttonAXTouched[2];
+	bool        buttonBY[2];
+	bool        buttonBYTouched[2];
+	bool        menu[2];
 };
 
 PFN_xrGetD3D11GraphicsRequirementsKHR ext_xrGetD3D11GraphicsRequirementsKHR = nullptr;
@@ -64,6 +101,7 @@ PFN_xrDestroyDebugUtilsMessengerEXT   ext_xrDestroyDebugUtilsMessengerEXT   = nu
 struct app_transform_buffer_t {
 	XMFLOAT4X4 world;
 	XMFLOAT4X4 viewproj;
+	XMFLOAT4   color_tint; // RGB tint multiplied onto vertex colors; W unused
 };
 
 XrFormFactor            app_config_form = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -80,6 +118,10 @@ ID3D11RasterizerState* app_rasterizer_state;
 
 void app_init();
 void app_draw(XrCompositionLayerProjectionView& layerView);
+void openxr_input_init();
+void openxr_input_update(XrTime predictedTime);
+void draw_box(XMMATRIX world_mat, XMMATRIX vp_mat, float r, float g, float b);
+void draw_controllers(XMMATRIX vp_mat);
 
 const XrPosef              xr_pose_identity = {{0, 0, 0, 1}, {0, 0, 0}};
 XrSession                  xr_session       = {};
@@ -128,6 +170,7 @@ constexpr char screen_shader_code[] = R"_(
 cbuffer TransformBuffer : register(b0) {
 	float4x4 world;
 	float4x4 viewproj;
+	float4   color_tint;
 };
 
 struct vsIn {
@@ -158,8 +201,8 @@ psIn vs(vsIn input) {
 	float ambient = 0.3; // Base ambient light
 	float lighting = ambient + (diffuse * 0.7); // 30% ambient + 70% diffuse
 
-	// Apply lighting to color
-	output.color = input.color * lighting;
+	// Apply lighting and tint to color
+	output.color = input.color * color_tint.rgb * lighting;
 
 	return output;
 }
@@ -506,6 +549,8 @@ bool openxr_init(const char* app_name, int64_t swapchain_format) {
 		xr_swapchains.push_back(swapchain);
 	}
 
+	openxr_input_init();
+
 	if (!opaque_channel_init()) {
 		OutputDebugStringA("Warning: Failed to initialize opaque data channel\n");
 	}
@@ -522,8 +567,10 @@ void openxr_shutdown() {
 	xr_swapchains.clear();
 
 	if (xr_input.actionSet != XR_NULL_HANDLE) {
-		if (xr_input.handSpace[0] != XR_NULL_HANDLE) xrDestroySpace(xr_input.handSpace[0]);
-		if (xr_input.handSpace[1] != XR_NULL_HANDLE) xrDestroySpace(xr_input.handSpace[1]);
+		for (int i = 0; i < 2; i++) {
+			if (xr_input.gripSpace[i] != XR_NULL_HANDLE) xrDestroySpace(xr_input.gripSpace[i]);
+			if (xr_input.aimSpace[i]  != XR_NULL_HANDLE) xrDestroySpace(xr_input.aimSpace[i]);
+		}
 		xrDestroyActionSet(xr_input.actionSet);
 	}
 	if (xr_app_space != XR_NULL_HANDLE) xrDestroySpace   (xr_app_space);
@@ -570,6 +617,9 @@ void openxr_render_frame() {
 	XrFrameState frame_state = { XR_TYPE_FRAME_STATE };
 	xrWaitFrame(xr_session, nullptr, &frame_state);
 	xrBeginFrame(xr_session, nullptr);
+
+	if (xr_session_state == XR_SESSION_STATE_FOCUSED)
+		openxr_input_update(frame_state.predictedDisplayTime);
 
 	XrCompositionLayerBaseHeader* layer = nullptr;
 	XrCompositionLayerProjection layer_proj = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
@@ -918,6 +968,434 @@ ID3DBlob* d3d_compile_shader(const char* hlsl, const char* entrypoint, const cha
 	return compiled;
 }
 
+void openxr_input_init() {
+	// Create action set
+	XrActionSetCreateInfo set_info = { XR_TYPE_ACTION_SET_CREATE_INFO };
+	strcpy_s(set_info.actionSetName, "controller_input");
+	strcpy_s(set_info.localizedActionSetName, "Controller Input");
+	set_info.priority = 0;
+	if (XR_FAILED(xrCreateActionSet(xr_instance, &set_info, &xr_input.actionSet))) {
+		OutputDebugStringA("Warning: Failed to create controller action set\n");
+		return;
+	}
+
+	// Subaction paths for each hand
+	xrStringToPath(xr_instance, "/user/hand/left",  &xr_input.handSubactionPath[0]);
+	xrStringToPath(xr_instance, "/user/hand/right", &xr_input.handSubactionPath[1]);
+
+	// Helper: create an action bound to both hands via subaction paths
+	auto create_action = [&](XrAction& action, const char* name, const char* localized, XrActionType type) {
+		XrActionCreateInfo info = { XR_TYPE_ACTION_CREATE_INFO };
+		info.actionType          = type;
+		info.countSubactionPaths = 2;
+		info.subactionPaths      = xr_input.handSubactionPath;
+		strcpy_s(info.actionName, name);
+		strcpy_s(info.localizedActionName, localized);
+		xrCreateAction(xr_input.actionSet, &info, &action);
+	};
+
+	create_action(xr_input.gripPoseAction,        "grip_pose",        "Grip Pose",          XR_ACTION_TYPE_POSE_INPUT);
+	create_action(xr_input.aimPoseAction,         "aim_pose",         "Aim Pose",           XR_ACTION_TYPE_POSE_INPUT);
+	create_action(xr_input.triggerValueAction,    "trigger_value",    "Trigger Value",      XR_ACTION_TYPE_FLOAT_INPUT);
+	create_action(xr_input.triggerTouchAction,    "trigger_touch",    "Trigger Touch",      XR_ACTION_TYPE_BOOLEAN_INPUT);
+	create_action(xr_input.gripValueAction,       "grip_value",       "Grip Value",         XR_ACTION_TYPE_FLOAT_INPUT);
+	create_action(xr_input.triggerSensorAction,   "trigger_sensor",   "Trigger Proximity",  XR_ACTION_TYPE_FLOAT_INPUT);
+	create_action(xr_input.gripSensorAction,      "grip_sensor",      "Grip Proximity",     XR_ACTION_TYPE_FLOAT_INPUT);
+	create_action(xr_input.thumbstickXAction,     "thumbstick_x",     "Thumbstick X",       XR_ACTION_TYPE_FLOAT_INPUT);
+	create_action(xr_input.thumbstickYAction,     "thumbstick_y",     "Thumbstick Y",       XR_ACTION_TYPE_FLOAT_INPUT);
+	create_action(xr_input.thumbstickTouchAction, "thumbstick_touch", "Thumbstick Touch",   XR_ACTION_TYPE_BOOLEAN_INPUT);
+	create_action(xr_input.thumbstickClickAction, "thumbstick_click", "Thumbstick Click",   XR_ACTION_TYPE_BOOLEAN_INPUT);
+	create_action(xr_input.buttonAXAction,        "button_ax",        "Button A/X",         XR_ACTION_TYPE_BOOLEAN_INPUT);
+	create_action(xr_input.buttonAXTouchAction,   "button_ax_touch",  "Button A/X Touch",   XR_ACTION_TYPE_BOOLEAN_INPUT);
+	create_action(xr_input.buttonBYAction,        "button_by",        "Button B/Y",         XR_ACTION_TYPE_BOOLEAN_INPUT);
+	create_action(xr_input.buttonBYTouchAction,   "button_by_touch",  "Button B/Y Touch",   XR_ACTION_TYPE_BOOLEAN_INPUT);
+	create_action(xr_input.menuClickAction,       "menu_click",       "Menu",               XR_ACTION_TYPE_BOOLEAN_INPUT);
+
+	// Suggest bindings for Oculus/Meta Touch controllers
+	{
+		XrPath paths[32];
+		XrActionSuggestedBinding bindings[32];
+		int count = 0;
+		auto bind = [&](XrAction action, const char* path_str) {
+			xrStringToPath(xr_instance, path_str, &paths[count]);
+			bindings[count] = { action, paths[count] };
+			count++;
+		};
+
+		bind(xr_input.gripPoseAction,        "/user/hand/left/input/grip/pose");
+		bind(xr_input.gripPoseAction,        "/user/hand/right/input/grip/pose");
+		bind(xr_input.aimPoseAction,         "/user/hand/left/input/aim/pose");
+		bind(xr_input.aimPoseAction,         "/user/hand/right/input/aim/pose");
+		bind(xr_input.triggerValueAction,    "/user/hand/left/input/trigger/value");
+		bind(xr_input.triggerValueAction,    "/user/hand/right/input/trigger/value");
+		bind(xr_input.triggerTouchAction,    "/user/hand/left/input/trigger/touch");
+		bind(xr_input.triggerTouchAction,    "/user/hand/right/input/trigger/touch");
+		bind(xr_input.gripValueAction,       "/user/hand/left/input/squeeze/value");
+		bind(xr_input.gripValueAction,       "/user/hand/right/input/squeeze/value");
+		bind(xr_input.thumbstickXAction,     "/user/hand/left/input/thumbstick/x");
+		bind(xr_input.thumbstickXAction,     "/user/hand/right/input/thumbstick/x");
+		bind(xr_input.thumbstickYAction,     "/user/hand/left/input/thumbstick/y");
+		bind(xr_input.thumbstickYAction,     "/user/hand/right/input/thumbstick/y");
+		bind(xr_input.thumbstickTouchAction, "/user/hand/left/input/thumbstick/touch");
+		bind(xr_input.thumbstickTouchAction, "/user/hand/right/input/thumbstick/touch");
+		bind(xr_input.thumbstickClickAction, "/user/hand/left/input/thumbstick/click");
+		bind(xr_input.thumbstickClickAction, "/user/hand/right/input/thumbstick/click");
+		bind(xr_input.buttonAXAction,        "/user/hand/left/input/x/click");
+		bind(xr_input.buttonAXAction,        "/user/hand/right/input/a/click");
+		bind(xr_input.buttonAXTouchAction,   "/user/hand/left/input/x/touch");
+		bind(xr_input.buttonAXTouchAction,   "/user/hand/right/input/a/touch");
+		bind(xr_input.buttonBYAction,        "/user/hand/left/input/y/click");
+		bind(xr_input.buttonBYAction,        "/user/hand/right/input/b/click");
+		bind(xr_input.buttonBYTouchAction,   "/user/hand/left/input/y/touch");
+		bind(xr_input.buttonBYTouchAction,   "/user/hand/right/input/b/touch");
+		bind(xr_input.menuClickAction,       "/user/hand/left/input/menu/click");
+
+		XrPath profile;
+		xrStringToPath(xr_instance, "/interaction_profiles/oculus/touch_controller", &profile);
+		XrInteractionProfileSuggestedBinding suggested = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+		suggested.interactionProfile     = profile;
+		suggested.suggestedBindings      = bindings;
+		suggested.countSuggestedBindings = count;
+		xrSuggestInteractionProfileBindings(xr_instance, &suggested);
+	}
+
+	// Suggest bindings for Sony PSVR2 Sense controllers
+	// Mapping derived from Sony's oculus_touch -> playstation_vr2_sense remapping:
+	//   trigger        -> l2/r2    (value + touch + proximity sensor)
+	//   grip           -> l1/r1    (analog value + proximity sensor)
+	//   thumbstick     -> left_stick/right_stick
+	//   X/A buttons    -> square/cross
+	//   Y/B buttons    -> triangle/circle
+	//   left menu      -> right options  (only options button exists on PSVR2)
+	{
+		XrPath paths[36];
+		XrActionSuggestedBinding bindings[36];
+		int count = 0;
+		auto bind = [&](XrAction action, const char* path_str) {
+			xrStringToPath(xr_instance, path_str, &paths[count]);
+			bindings[count] = { action, paths[count] };
+			count++;
+		};
+
+		bind(xr_input.gripPoseAction,        "/user/hand/left/input/grip/pose");
+		bind(xr_input.gripPoseAction,        "/user/hand/right/input/grip/pose");
+		bind(xr_input.aimPoseAction,         "/user/hand/left/input/aim/pose");
+		bind(xr_input.aimPoseAction,         "/user/hand/right/input/aim/pose");
+		bind(xr_input.triggerValueAction,    "/user/hand/left/input/l2/value");
+		bind(xr_input.triggerValueAction,    "/user/hand/right/input/r2/value");
+		bind(xr_input.triggerTouchAction,    "/user/hand/left/input/l2/touch");
+		bind(xr_input.triggerTouchAction,    "/user/hand/right/input/r2/touch");
+		bind(xr_input.triggerSensorAction,   "/user/hand/left/input/l2_sensor/value");
+		bind(xr_input.triggerSensorAction,   "/user/hand/right/input/r2_sensor/value");
+		bind(xr_input.gripValueAction,       "/user/hand/left/input/l1/value");   // l1/r1 are analog triggers on PSVR2
+		bind(xr_input.gripValueAction,       "/user/hand/right/input/r1/value");
+		bind(xr_input.gripSensorAction,      "/user/hand/left/input/l1_sensor/value");
+		bind(xr_input.gripSensorAction,      "/user/hand/right/input/r1_sensor/value");
+		bind(xr_input.thumbstickXAction,     "/user/hand/left/input/left_stick/x");
+		bind(xr_input.thumbstickXAction,     "/user/hand/right/input/right_stick/x");
+		bind(xr_input.thumbstickYAction,     "/user/hand/left/input/left_stick/y");
+		bind(xr_input.thumbstickYAction,     "/user/hand/right/input/right_stick/y");
+		bind(xr_input.thumbstickTouchAction, "/user/hand/left/input/left_stick/touch");
+		bind(xr_input.thumbstickTouchAction, "/user/hand/right/input/right_stick/touch");
+		bind(xr_input.thumbstickClickAction, "/user/hand/left/input/left_stick/click");
+		bind(xr_input.thumbstickClickAction, "/user/hand/right/input/right_stick/click");
+		bind(xr_input.buttonAXAction,        "/user/hand/left/input/square/click");
+		bind(xr_input.buttonAXAction,        "/user/hand/right/input/cross/click");
+		bind(xr_input.buttonAXTouchAction,   "/user/hand/left/input/square/touch");
+		bind(xr_input.buttonAXTouchAction,   "/user/hand/right/input/cross/touch");
+		bind(xr_input.buttonBYAction,        "/user/hand/left/input/triangle/click");
+		bind(xr_input.buttonBYAction,        "/user/hand/right/input/circle/click");
+		bind(xr_input.buttonBYTouchAction,   "/user/hand/left/input/triangle/touch");
+		bind(xr_input.buttonBYTouchAction,   "/user/hand/right/input/circle/touch");
+		bind(xr_input.menuClickAction,       "/user/hand/right/input/options/click");
+
+		XrPath profile;
+		xrStringToPath(xr_instance, "/interaction_profiles/sony/playstation_vr2_sense_controller", &profile);
+		XrInteractionProfileSuggestedBinding suggested = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+		suggested.interactionProfile     = profile;
+		suggested.suggestedBindings      = bindings;
+		suggested.countSuggestedBindings = count;
+		xrSuggestInteractionProfileBindings(xr_instance, &suggested);
+	}
+
+	// Suggest bindings for KHR simple controller (fallback)
+	{
+		XrPath paths[8];
+		XrActionSuggestedBinding bindings[8];
+		int count = 0;
+		auto bind = [&](XrAction action, const char* path_str) {
+			xrStringToPath(xr_instance, path_str, &paths[count]);
+			bindings[count] = { action, paths[count] };
+			count++;
+		};
+
+		bind(xr_input.gripPoseAction,     "/user/hand/left/input/grip/pose");
+		bind(xr_input.gripPoseAction,     "/user/hand/right/input/grip/pose");
+		bind(xr_input.aimPoseAction,      "/user/hand/left/input/aim/pose");
+		bind(xr_input.aimPoseAction,      "/user/hand/right/input/aim/pose");
+		bind(xr_input.triggerValueAction, "/user/hand/left/input/select/click");
+		bind(xr_input.triggerValueAction, "/user/hand/right/input/select/click");
+		bind(xr_input.menuClickAction,    "/user/hand/left/input/menu/click");
+		bind(xr_input.menuClickAction,    "/user/hand/right/input/menu/click");
+
+		XrPath profile;
+		xrStringToPath(xr_instance, "/interaction_profiles/khr/simple_controller", &profile);
+		XrInteractionProfileSuggestedBinding suggested = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+		suggested.interactionProfile     = profile;
+		suggested.suggestedBindings      = bindings;
+		suggested.countSuggestedBindings = count;
+		xrSuggestInteractionProfileBindings(xr_instance, &suggested);
+	}
+
+	// Attach action set to session before xrBeginSession is called
+	XrSessionActionSetsAttachInfo attach = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
+	attach.countActionSets = 1;
+	attach.actionSets      = &xr_input.actionSet;
+	xrAttachSessionActionSets(xr_session, &attach);
+
+	// Create grip and aim spaces for each hand
+	for (int i = 0; i < 2; i++) {
+		XrActionSpaceCreateInfo grip_info = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
+		grip_info.action            = xr_input.gripPoseAction;
+		grip_info.subactionPath     = xr_input.handSubactionPath[i];
+		grip_info.poseInActionSpace = xr_pose_identity;
+		xrCreateActionSpace(xr_session, &grip_info, &xr_input.gripSpace[i]);
+
+		XrActionSpaceCreateInfo aim_info = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
+		aim_info.action            = xr_input.aimPoseAction;
+		aim_info.subactionPath     = xr_input.handSubactionPath[i];
+		aim_info.poseInActionSpace = xr_pose_identity;
+		xrCreateActionSpace(xr_session, &aim_info, &xr_input.aimSpace[i]);
+	}
+}
+
+void openxr_input_update(XrTime predictedTime) {
+	if (xr_input.actionSet == XR_NULL_HANDLE) return;
+
+	XrActiveActionSet active = { xr_input.actionSet, XR_NULL_PATH };
+	XrActionsSyncInfo sync   = { XR_TYPE_ACTIONS_SYNC_INFO };
+	sync.countActiveActionSets = 1;
+	sync.activeActionSets      = &active;
+	xrSyncActions(xr_session, &sync);
+
+	for (int hand = 0; hand < 2; hand++) {
+		XrPath sub = xr_input.handSubactionPath[hand];
+
+		// Reset per-frame state so stale values don't persist when isActive is false
+		xr_input.triggerValue[hand]      = 0.f;
+		xr_input.triggerTouched[hand]    = false;
+		xr_input.gripValue[hand]         = 0.f;
+		xr_input.triggerSensor[hand]     = 0.f;
+		xr_input.gripSensor[hand]        = 0.f;
+		xr_input.thumbstickX[hand]       = 0.f;
+		xr_input.thumbstickY[hand]       = 0.f;
+		xr_input.thumbstickTouched[hand] = false;
+		xr_input.thumbstickClicked[hand] = false;
+		xr_input.buttonAX[hand]          = false;
+		xr_input.buttonAXTouched[hand]   = false;
+		xr_input.buttonBY[hand]          = false;
+		xr_input.buttonBYTouched[hand]   = false;
+		xr_input.menu[hand]              = false;
+
+		// Check if the grip pose action is active and locate the hand
+		XrActionStatePose    pose_s = { XR_TYPE_ACTION_STATE_POSE };
+		XrActionStateGetInfo get_i  = { XR_TYPE_ACTION_STATE_GET_INFO };
+		get_i.action        = xr_input.gripPoseAction;
+		get_i.subactionPath = sub;
+		xrGetActionStatePose(xr_session, &get_i, &pose_s);
+		xr_input.poseValid[hand] = (bool)pose_s.isActive;
+
+		if (pose_s.isActive) {
+			XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
+			xrLocateSpace(xr_input.gripSpace[hand], xr_app_space, predictedTime, &loc);
+			bool pos_ok = (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)    != 0;
+			bool rot_ok = (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0;
+			if (pos_ok && rot_ok) xr_input.gripPose[hand] = loc.pose;
+			else                  xr_input.poseValid[hand] = false;
+		}
+
+		// Helpers to read float and bool action states.
+		// Always write through on success: when isActive is false the runtime reports
+		// the default/neutral value (0.0 / false), which is what we want rather than
+		// leaving stale state from the previous frame.
+		auto get_f = [&](XrAction action, float& out) {
+			XrActionStateFloat   s = { XR_TYPE_ACTION_STATE_FLOAT };
+			XrActionStateGetInfo g = { XR_TYPE_ACTION_STATE_GET_INFO };
+			g.action = action; g.subactionPath = sub;
+			if (XR_SUCCEEDED(xrGetActionStateFloat(xr_session, &g, &s)))
+				out = s.isActive ? s.currentState : 0.f;
+		};
+		auto get_b = [&](XrAction action, bool& out) {
+			XrActionStateBoolean s = { XR_TYPE_ACTION_STATE_BOOLEAN };
+			XrActionStateGetInfo g = { XR_TYPE_ACTION_STATE_GET_INFO };
+			g.action = action; g.subactionPath = sub;
+			if (XR_SUCCEEDED(xrGetActionStateBoolean(xr_session, &g, &s)))
+				out = s.isActive && (bool)s.currentState;
+		};
+
+		get_f(xr_input.triggerValueAction,    xr_input.triggerValue[hand]);
+		get_b(xr_input.triggerTouchAction,    xr_input.triggerTouched[hand]);
+		get_f(xr_input.gripValueAction,       xr_input.gripValue[hand]);
+		get_f(xr_input.triggerSensorAction,   xr_input.triggerSensor[hand]);
+		get_f(xr_input.gripSensorAction,      xr_input.gripSensor[hand]);
+		get_f(xr_input.thumbstickXAction,     xr_input.thumbstickX[hand]);
+		get_f(xr_input.thumbstickYAction,     xr_input.thumbstickY[hand]);
+		get_b(xr_input.thumbstickTouchAction, xr_input.thumbstickTouched[hand]);
+		get_b(xr_input.thumbstickClickAction, xr_input.thumbstickClicked[hand]);
+		get_b(xr_input.buttonAXAction,        xr_input.buttonAX[hand]);
+		get_b(xr_input.buttonAXTouchAction,   xr_input.buttonAXTouched[hand]);
+		get_b(xr_input.buttonBYAction,        xr_input.buttonBY[hand]);
+		get_b(xr_input.buttonBYTouchAction,   xr_input.buttonBYTouched[hand]);
+		get_b(xr_input.menuClickAction,       xr_input.menu[hand]);
+	}
+}
+
+// Draw one colored unit cube scaled/positioned by world_mat.
+// Requires the pipeline state (shaders, IA layout, vertex/index buffers) to already be set.
+void draw_box(XMMATRIX world_mat, XMMATRIX vp_mat, float r, float g, float b) {
+	app_transform_buffer_t buf;
+	XMStoreFloat4x4(&buf.world,    XMMatrixTranspose(world_mat));
+	XMStoreFloat4x4(&buf.viewproj, XMMatrixTranspose(vp_mat));
+	buf.color_tint = { r, g, b, 1.0f };
+	d3d_context->UpdateSubresource(app_constant_buffer, 0, nullptr, &buf, 0, 0);
+	d3d_context->DrawIndexed((UINT)_countof(screen_inds), 0, 0);
+}
+
+// Draw controller bodies and 10-slot input indicator panels above each hand.
+//
+// Indicator layout (controller-local space, floating PANEL_Y above grip center):
+//   Slot 0: Trigger value    (0–1 bar, green,  taller = more pressed)
+//   Slot 1: Grip value       (0–1 bar, blue,   taller = more squeezed)
+//   Slot 2: Thumbstick X     (–1..1, yellow dot slides up/down in gray bar)
+//   Slot 3: Thumbstick Y     (–1..1, cyan   dot slides up/down in gray bar)
+//   Slot 4: A/X button       (gray=idle, yellow=touched, green=pressed)
+//   Slot 5: B/Y button       (gray=idle, yellow=touched, green=pressed)
+//   Slot 6: Thumbstick btn   (gray=idle, yellow=touched, green=pressed)
+//   Slot 7: Menu button      (gray=idle, orange=pressed)
+//   Slot 8: Trigger proximity sensor (0–1 bar, magenta, PSVR2 l2/r2 sensor)
+//   Slot 9: Grip proximity sensor    (0–1 bar, orange,  PSVR2 l1/r1 sensor)
+void draw_controllers(XMMATRIX vp_mat) {
+	if (xr_input.actionSet == XR_NULL_HANDLE) return;
+
+	const float PANEL_Y = 0.12f;   // meters above controller grip center (local +Y)
+	const float PANEL_Z = -0.01f;  // slightly forward
+	const float SPACING = 0.022f;  // per-slot horizontal spacing
+	const float BAR_H   = 0.044f;  // max analog bar height
+	const float IND_W   = 0.018f;  // indicator face width/depth
+	const float IND_D   = 0.008f;  // indicator slab thickness
+
+	// x position for slot i, centered across 10 slots
+	auto sx = [&](int i) { return (i - 4.5f) * SPACING; };
+
+	// Button color: gray = idle, yellow = touched, green = pressed
+	auto btn_rgb = [](bool pressed, bool touched, float& r, float& g, float& b) {
+		if      (pressed) { r = 0.2f; g = 1.0f; b = 0.2f; }
+		else if (touched) { r = 1.0f; g = 0.9f; b = 0.1f; }
+		else              { r = 0.3f; g = 0.3f; b = 0.3f; }
+	};
+
+	for (int hand = 0; hand < 2; hand++) {
+		if (!xr_input.poseValid[hand]) continue;
+
+		// Build grip-local → world matrix
+		XMVECTOR pos  = XMLoadFloat3((XMFLOAT3*)&xr_input.gripPose[hand].position);
+		XMVECTOR rot  = XMLoadFloat4((XMFLOAT4*)&xr_input.gripPose[hand].orientation);
+		XMMATRIX grip = XMMatrixAffineTransformation(g_XMOne, g_XMZero, rot, pos);
+
+		// Controller body: elongated in local +Y axis
+		draw_box(XMMatrixScaling(0.03f, 0.12f, 0.03f) * grip, vp_mat, 0.85f, 0.85f, 0.95f);
+
+		// Helper: draw a box in controller-local space then transform to world
+		auto loc_box = [&](float lx, float ly, float lz,
+		                   float sw, float sh, float sd,
+		                   float r, float g, float b) {
+			draw_box(XMMatrixScaling(sw, sh, sd) * XMMatrixTranslation(lx, ly, lz) * grip,
+			         vp_mat, r, g, b);
+		};
+
+		// SLOT 0 – Trigger (0..1 bar, green, brightness indicates touch)
+		{
+			float x = sx(0), v = xr_input.triggerValue[hand];
+			loc_box(x, PANEL_Y, PANEL_Z, IND_W, BAR_H, IND_D, 0.12f, 0.12f, 0.12f); // bg
+			float fh = max(v * BAR_H, 0.004f);
+			float fy = PANEL_Y - BAR_H * 0.5f + fh * 0.5f;
+			float brightness = xr_input.triggerTouched[hand] ? 0.9f : 0.45f;
+			loc_box(x, fy, PANEL_Z, IND_W - 0.004f, fh, IND_D + 0.002f, 0.1f, brightness, 0.1f);
+		}
+
+		// SLOT 1 – Grip (0..1 bar, blue)
+		{
+			float x = sx(1), v = xr_input.gripValue[hand];
+			loc_box(x, PANEL_Y, PANEL_Z, IND_W, BAR_H, IND_D, 0.12f, 0.12f, 0.12f);
+			float fh = max(v * BAR_H, 0.004f);
+			float fy = PANEL_Y - BAR_H * 0.5f + fh * 0.5f;
+			loc_box(x, fy, PANEL_Z, IND_W - 0.004f, fh, IND_D + 0.002f, 0.1f, 0.4f, 0.9f);
+		}
+
+		// SLOT 2 – Thumbstick X (–1..1, yellow dot position)
+		{
+			float x = sx(2), v = xr_input.thumbstickX[hand];
+			loc_box(x, PANEL_Y, PANEL_Z, IND_W, BAR_H, IND_D, 0.12f, 0.12f, 0.12f);
+			float dot_y = PANEL_Y + v * BAR_H * 0.45f;
+			loc_box(x, dot_y, PANEL_Z, IND_W - 0.004f, 0.006f, IND_D + 0.002f, 0.95f, 0.85f, 0.1f);
+		}
+
+		// SLOT 3 – Thumbstick Y (–1..1, cyan dot position)
+		{
+			float x = sx(3), v = xr_input.thumbstickY[hand];
+			loc_box(x, PANEL_Y, PANEL_Z, IND_W, BAR_H, IND_D, 0.12f, 0.12f, 0.12f);
+			float dot_y = PANEL_Y + v * BAR_H * 0.45f;
+			loc_box(x, dot_y, PANEL_Z, IND_W - 0.004f, 0.006f, IND_D + 0.002f, 0.1f, 0.85f, 0.95f);
+		}
+
+		// SLOT 4 – A/X button
+		{
+			float r, g, b;
+			btn_rgb(xr_input.buttonAX[hand], xr_input.buttonAXTouched[hand], r, g, b);
+			loc_box(sx(4), PANEL_Y, PANEL_Z, IND_W, IND_W, IND_D, r, g, b);
+		}
+
+		// SLOT 5 – B/Y button
+		{
+			float r, g, b;
+			btn_rgb(xr_input.buttonBY[hand], xr_input.buttonBYTouched[hand], r, g, b);
+			loc_box(sx(5), PANEL_Y, PANEL_Z, IND_W, IND_W, IND_D, r, g, b);
+		}
+
+		// SLOT 6 – Thumbstick click (touch = yellow, press = green)
+		{
+			float r, g, b;
+			btn_rgb(xr_input.thumbstickClicked[hand], xr_input.thumbstickTouched[hand], r, g, b);
+			loc_box(sx(6), PANEL_Y, PANEL_Z, IND_W, IND_W, IND_D, r, g, b);
+		}
+
+		// SLOT 7 – Menu (orange when pressed)
+		{
+			float r = 0.3f, g = 0.3f, b = 0.3f;
+			if (xr_input.menu[hand]) { r = 1.0f; g = 0.5f; b = 0.0f; }
+			loc_box(sx(7), PANEL_Y, PANEL_Z, IND_W, IND_W, IND_D, r, g, b);
+		}
+
+		// SLOT 8 – Trigger proximity sensor (0..1 bar, magenta; PSVR2 l2/r2 sensor)
+		{
+			float x = sx(8), v = xr_input.triggerSensor[hand];
+			loc_box(x, PANEL_Y, PANEL_Z, IND_W, BAR_H, IND_D, 0.12f, 0.12f, 0.12f);
+			float fh = max(v * BAR_H, 0.004f);
+			float fy = PANEL_Y - BAR_H * 0.5f + fh * 0.5f;
+			loc_box(x, fy, PANEL_Z, IND_W - 0.004f, fh, IND_D + 0.002f, 0.9f, 0.1f, 0.9f);
+		}
+
+		// SLOT 9 – Grip proximity sensor (0..1 bar, orange; PSVR2 l1/r1 sensor)
+		{
+			float x = sx(9), v = xr_input.gripSensor[hand];
+			loc_box(x, PANEL_Y, PANEL_Z, IND_W, BAR_H, IND_D, 0.12f, 0.12f, 0.12f);
+			float fh = max(v * BAR_H, 0.004f);
+			float fy = PANEL_Y - BAR_H * 0.5f + fh * 0.5f;
+			loc_box(x, fy, PANEL_Z, IND_W - 0.004f, fh, IND_D + 0.002f, 0.9f, 0.5f, 0.1f);
+		}
+	}
+}
+
 void app_init() {
 	// Compile shaders (use new cube shader code)
 	ID3DBlob* vert_shader_blob = d3d_compile_shader(screen_shader_code, "vs", "vs_5_0");
@@ -990,11 +1468,17 @@ void app_draw(XrCompositionLayerProjectionView& view) {
 
 	XMMATRIX mat_model = XMMatrixScaling(0.7f, 0.7f, 0.7f) * mat_rotation * XMMatrixTranslation(0.0f, -0.6f, -2.0f);
 
-	// Update shader constants
+	XMMATRIX mat_viewproj = mat_view * mat_projection;
+
+	// Draw the main animated cube
 	app_transform_buffer_t transform_buffer;
-	XMStoreFloat4x4(&transform_buffer.world, XMMatrixTranspose(mat_model));
-	XMStoreFloat4x4(&transform_buffer.viewproj, XMMatrixTranspose(mat_view * mat_projection));
+	XMStoreFloat4x4(&transform_buffer.world,    XMMatrixTranspose(mat_model));
+	XMStoreFloat4x4(&transform_buffer.viewproj, XMMatrixTranspose(mat_viewproj));
+	transform_buffer.color_tint = { 1.0f, 1.0f, 1.0f, 1.0f };
 
 	d3d_context->UpdateSubresource(app_constant_buffer, 0, nullptr, &transform_buffer, 0, 0);
 	d3d_context->DrawIndexed((UINT)_countof(screen_inds), 0, 0);
+
+	// Draw controllers and their input indicator panels
+	draw_controllers(mat_viewproj);
 }
