@@ -52,6 +52,7 @@ struct input_state_t {
 	// Pose actions
 	XrAction    gripPoseAction;
 	XrAction    aimPoseAction;
+	XrAction    gazeAction;       // XR_EXT_eye_gaze_interaction
 
 	// Analog actions (float)
 	XrAction    triggerValueAction;
@@ -74,10 +75,13 @@ struct input_state_t {
 	XrPath      handSubactionPath[2]; // 0 = left, 1 = right
 	XrSpace     gripSpace[2];
 	XrSpace     aimSpace[2];
+	XrSpace     gazeSpace;            // XR_EXT_eye_gaze_interaction
 
 	// Per-frame state (populated by openxr_input_update each frame)
 	XrPosef     gripPose[2];
 	bool        poseValid[2];
+	XrPosef     gazePose;
+	bool        gazeValid;
 	float       triggerValue[2];
 	bool        triggerTouched[2];
 	float       gripValue[2];
@@ -104,9 +108,11 @@ struct app_transform_buffer_t {
 	XMFLOAT4   color_tint; // RGB tint multiplied onto vertex colors; W unused
 };
 
-XrFormFactor            app_config_form = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-XrViewConfigurationType app_config_view = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-bool                    app_is_ios_mode = false;
+XrFormFactor            app_config_form      = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+XrViewConfigurationType app_config_view      = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+bool                    app_is_ios_mode      = false;
+bool                    app_has_quad_views   = false;
+bool                    app_has_eye_gaze     = false;
 
 ID3D11VertexShader*    app_vshader;
 ID3D11PixelShader*     app_pshader;
@@ -117,7 +123,7 @@ ID3D11Buffer*          app_index_buffer;
 ID3D11RasterizerState* app_rasterizer_state;
 
 void app_init();
-void app_draw(XrCompositionLayerProjectionView& layerView);
+void app_draw(XrCompositionLayerProjectionView& layerView, int view_index = -1);
 void openxr_input_init();
 void openxr_input_update(XrTime predictedTime);
 void draw_box(XMMATRIX world_mat, XMMATRIX vp_mat, float r, float g, float b);
@@ -139,6 +145,7 @@ vector<swapchain_t>             xr_swapchains;
 
 bool openxr_init(const char* app_name, int64_t swapchain_format);
 void openxr_shutdown();
+void log_interaction_profiles();
 void openxr_poll_events(bool& exit);
 void openxr_render_frame();
 bool openxr_render_layer(XrTime predictedTime, vector<XrCompositionLayerProjectionView>& projectionViews, XrCompositionLayerProjection& layer);
@@ -157,7 +164,7 @@ bool d3d_init(LUID& adapter_luid);
 void d3d_shutdown();
 IDXGIAdapter1* d3d_get_adapter(LUID& adapter_luid);
 swapchain_surfdata_t d3d_make_surface_data(XrBaseInStructure& swapchainImage);
-void d3d_render_layer(XrCompositionLayerProjectionView& layerView, swapchain_surfdata_t& surface);
+void d3d_render_layer(XrCompositionLayerProjectionView& layerView, swapchain_surfdata_t& surface, int view_index);
 void d3d_swapchain_destroy(swapchain_t& swapchain);
 XMMATRIX d3d_xr_projection(XrFovf fov, float clip_near, float clip_far);
 ID3DBlob* d3d_compile_shader(const char* hlsl, const char* entrypoint, const char* target);
@@ -401,10 +408,12 @@ bool openxr_init(const char* app_name, int64_t swapchain_format) {
 
 	SetProcessDPIAware();
 	vector<const char*> use_extensions;
-	const char* ask_extensions[] = { 
+	const char* ask_extensions[] = {
 		XR_KHR_D3D11_ENABLE_EXTENSION_NAME, // Use Direct3D11 for rendering
 		XR_EXT_DEBUG_UTILS_EXTENSION_NAME,  // Debug utils for extra info
 		"XR_NVX1_opaque_data_channel",
+		"XR_VARJO_quad_views",              // Varjo foveal quad-view support
+		XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME, // Eye gaze tracking
 	};
 
 	uint32_t ext_count = 0;
@@ -429,6 +438,11 @@ bool openxr_init(const char* app_name, int64_t swapchain_format) {
 			return strcmp(ext, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0;
 		}))
 		return false;
+
+	app_has_quad_views = std::any_of(use_extensions.begin(), use_extensions.end(),
+		[](const char* ext) { return strcmp(ext, "XR_VARJO_quad_views") == 0; });
+	app_has_eye_gaze = std::any_of(use_extensions.begin(), use_extensions.end(),
+		[](const char* ext) { return strcmp(ext, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME) == 0; });
 
 	// Initialize OpenXR with the extensions we've found
 	XrInstanceCreateInfo createInfo = { XR_TYPE_INSTANCE_CREATE_INFO };
@@ -492,6 +506,10 @@ bool openxr_init(const char* app_name, int64_t swapchain_format) {
 	XrSystemGetInfo systemInfo = { XR_TYPE_SYSTEM_GET_INFO };
 	systemInfo.formFactor = app_config_form;
 	xrGetSystem(xr_instance, &systemInfo, &xr_system_id);
+
+	// If quad_views extension is available, prefer it for Varjo foveal rendering
+	if (app_has_quad_views && !app_is_ios_mode)
+		app_config_view = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO;
 
 	XrGraphicsRequirementsD3D11KHR requirement = { XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR };
 	ext_xrGetD3D11GraphicsRequirementsKHR(xr_instance, xr_system_id, &requirement);
@@ -571,12 +589,37 @@ void openxr_shutdown() {
 			if (xr_input.gripSpace[i] != XR_NULL_HANDLE) xrDestroySpace(xr_input.gripSpace[i]);
 			if (xr_input.aimSpace[i]  != XR_NULL_HANDLE) xrDestroySpace(xr_input.aimSpace[i]);
 		}
+		if (xr_input.gazeSpace != XR_NULL_HANDLE) xrDestroySpace(xr_input.gazeSpace);
 		xrDestroyActionSet(xr_input.actionSet);
 	}
 	if (xr_app_space != XR_NULL_HANDLE) xrDestroySpace   (xr_app_space);
 	if (xr_session   != XR_NULL_HANDLE) xrDestroySession (xr_session);
 	if (xr_debug     != XR_NULL_HANDLE) ext_xrDestroyDebugUtilsMessengerEXT(xr_debug);
 	if (xr_instance  != XR_NULL_HANDLE) xrDestroyInstance(xr_instance);
+}
+
+void log_interaction_profiles() {
+	const char* hand_path_strs[2] = { "/user/hand/left", "/user/hand/right" };
+	const char* hand_names[2]     = { "left",            "right"            };
+	for (int i = 0; i < 2; i++) {
+		XrPath hand_path;
+		xrStringToPath(xr_instance, hand_path_strs[i], &hand_path);
+
+		XrInteractionProfileState profile_state = { XR_TYPE_INTERACTION_PROFILE_STATE };
+		if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(xr_session, hand_path, &profile_state))
+		    && profile_state.interactionProfile != XR_NULL_PATH) {
+			char profile_str[256] = {};
+			uint32_t out_len = 0;
+			xrPathToString(xr_instance, profile_state.interactionProfile, sizeof(profile_str), &out_len, profile_str);
+			char msg[512];
+			sprintf_s(msg, "Active interaction profile (%s): %s\n", hand_names[i], profile_str);
+			OutputDebugStringA(msg);
+		} else {
+			char msg[128];
+			sprintf_s(msg, "Active interaction profile (%s): (none yet)\n", hand_names[i]);
+			OutputDebugStringA(msg);
+		}
+	}
 }
 
 void openxr_poll_events(bool& exit) {
@@ -607,6 +650,10 @@ void openxr_poll_events(bool& exit) {
 			}
 		} break;
 		case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING: exit = true; return;
+		case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
+			OutputDebugStringA("Interaction profile changed:\n");
+			log_interaction_profiles();
+			break;
 		}
 		event_buffer = { XR_TYPE_EVENT_DATA_BUFFER };
 	}
@@ -667,7 +714,7 @@ bool openxr_render_layer(XrTime predictedTime, vector<XrCompositionLayerProjecti
 		views[i].subImage.imageRect.offset = { 0, 0 };
 		views[i].subImage.imageRect.extent = { xr_swapchains[i].width, xr_swapchains[i].height };
 
-		d3d_render_layer(views[i], xr_swapchains[i].surface_data[img_id]);
+		d3d_render_layer(views[i], xr_swapchains[i].surface_data[img_id], (int)i);
 
 		XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 		xrReleaseSwapchainImage(xr_swapchains[i].handle, &release_info);
@@ -920,7 +967,7 @@ swapchain_surfdata_t d3d_make_surface_data(XrBaseInStructure& swapchain_img) {
 	return result;
 }
 
-void d3d_render_layer(XrCompositionLayerProjectionView& view, swapchain_surfdata_t& surface) {
+void d3d_render_layer(XrCompositionLayerProjectionView& view, swapchain_surfdata_t& surface, int view_index) {
 	XrRect2Di&     rect     = view.subImage.imageRect;
 	D3D11_VIEWPORT viewport = CD3D11_VIEWPORT((float)rect.offset.x, (float)rect.offset.y, (float)rect.extent.width, (float)rect.extent.height);
 	d3d_context->RSSetViewports(1, &viewport);
@@ -932,7 +979,7 @@ void d3d_render_layer(XrCompositionLayerProjectionView& view, swapchain_surfdata
 	d3d_context->ClearDepthStencilView(surface.depth_view, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 	d3d_context->OMSetRenderTargets(1, &surface.target_view, surface.depth_view);
 
-	app_draw(view);
+	app_draw(view, view_index);
 }
 
 void d3d_swapchain_destroy(swapchain_t& swapchain) {
@@ -983,6 +1030,7 @@ void openxr_input_init() {
 	xrStringToPath(xr_instance, "/user/hand/left",  &xr_input.handSubactionPath[0]);
 	xrStringToPath(xr_instance, "/user/hand/right", &xr_input.handSubactionPath[1]);
 
+	
 	// Helper: create an action bound to both hands via subaction paths
 	auto create_action = [&](XrAction& action, const char* name, const char* localized, XrActionType type) {
 		XrActionCreateInfo info = { XR_TYPE_ACTION_CREATE_INFO };
@@ -1010,6 +1058,16 @@ void openxr_input_init() {
 	create_action(xr_input.buttonBYAction,        "button_by",        "Button B/Y",         XR_ACTION_TYPE_BOOLEAN_INPUT);
 	create_action(xr_input.buttonBYTouchAction,   "button_by_touch",  "Button B/Y Touch",   XR_ACTION_TYPE_BOOLEAN_INPUT);
 	create_action(xr_input.menuClickAction,       "menu_click",       "Menu",               XR_ACTION_TYPE_BOOLEAN_INPUT);
+
+	// Eye gaze action has no subaction paths (single /user/eyes_ext source)
+	if (app_has_eye_gaze) {
+		XrActionCreateInfo info = { XR_TYPE_ACTION_CREATE_INFO };
+		info.actionType          = XR_ACTION_TYPE_POSE_INPUT;
+		info.countSubactionPaths = 0;
+		strcpy_s(info.actionName,          "eye_gaze");
+		strcpy_s(info.localizedActionName, "Eye Gaze");
+		xrCreateAction(xr_input.actionSet, &info, &xr_input.gazeAction);
+	}
 
 	// Suggest bindings for Oculus/Meta Touch controllers
 	{
@@ -1059,7 +1117,8 @@ void openxr_input_init() {
 		xrSuggestInteractionProfileBindings(xr_instance, &suggested);
 	}
 
-	// Suggest bindings for Sony PSVR2 Sense controllers
+	// Suggest bindings for Sony PSVR2 Sense controllers but with a different interaction profile path (sony/ps_sense)
+	// as seen in the cxr log files 
 	// Mapping derived from Sony's oculus_touch -> playstation_vr2_sense remapping:
 	//   trigger        -> l2/r2    (value + touch + proximity sensor)
 	//   grip           -> l1/r1    (analog value + proximity sensor)
@@ -1110,10 +1169,69 @@ void openxr_input_init() {
 		bind(xr_input.menuClickAction,       "/user/hand/right/input/options/click");
 
 		XrPath profile;
-		xrStringToPath(xr_instance, "/interaction_profiles/sony/playstation_vr2_sense_controller", &profile);
+		xrStringToPath(xr_instance, "/interaction_profiles/sony/ps_sense", &profile);
 		XrInteractionProfileSuggestedBinding suggested = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
 		suggested.interactionProfile     = profile;
 		suggested.suggestedBindings      = bindings;
+		suggested.countSuggestedBindings = count;
+		xrSuggestInteractionProfileBindings(xr_instance, &suggested);
+	}
+
+	// Suggest bindings for Sony PSVR2 Sense controllers
+// Mapping derived from Sony's oculus_touch -> playstation_vr2_sense remapping:
+//   trigger        -> l2/r2    (value + touch + proximity sensor)
+//   grip           -> l1/r1    (analog value + proximity sensor)
+//   thumbstick     -> left_stick/right_stick
+//   X/A buttons    -> square/cross
+//   Y/B buttons    -> triangle/circle
+//   left menu      -> right options  (only options button exists on PSVR2)
+	{
+		XrPath paths[36];
+		XrActionSuggestedBinding bindings[36];
+		int count = 0;
+		auto bind = [&](XrAction action, const char* path_str) {
+			xrStringToPath(xr_instance, path_str, &paths[count]);
+			bindings[count] = { action, paths[count] };
+			count++;
+			};
+
+		bind(xr_input.gripPoseAction, "/user/hand/left/input/grip/pose");
+		bind(xr_input.gripPoseAction, "/user/hand/right/input/grip/pose");
+		bind(xr_input.aimPoseAction, "/user/hand/left/input/aim/pose");
+		bind(xr_input.aimPoseAction, "/user/hand/right/input/aim/pose");
+		bind(xr_input.triggerValueAction, "/user/hand/left/input/l2/value");
+		bind(xr_input.triggerValueAction, "/user/hand/right/input/r2/value");
+		bind(xr_input.triggerTouchAction, "/user/hand/left/input/l2/touch");
+		bind(xr_input.triggerTouchAction, "/user/hand/right/input/r2/touch");
+		bind(xr_input.triggerSensorAction, "/user/hand/left/input/l2_sensor/value");
+		bind(xr_input.triggerSensorAction, "/user/hand/right/input/r2_sensor/value");
+		bind(xr_input.gripValueAction, "/user/hand/left/input/l1/value");   // l1/r1 are analog triggers on PSVR2
+		bind(xr_input.gripValueAction, "/user/hand/right/input/r1/value");
+		bind(xr_input.gripSensorAction, "/user/hand/left/input/l1_sensor/value");
+		bind(xr_input.gripSensorAction, "/user/hand/right/input/r1_sensor/value");
+		bind(xr_input.thumbstickXAction, "/user/hand/left/input/left_stick/x");
+		bind(xr_input.thumbstickXAction, "/user/hand/right/input/right_stick/x");
+		bind(xr_input.thumbstickYAction, "/user/hand/left/input/left_stick/y");
+		bind(xr_input.thumbstickYAction, "/user/hand/right/input/right_stick/y");
+		bind(xr_input.thumbstickTouchAction, "/user/hand/left/input/left_stick/touch");
+		bind(xr_input.thumbstickTouchAction, "/user/hand/right/input/right_stick/touch");
+		bind(xr_input.thumbstickClickAction, "/user/hand/left/input/left_stick/click");
+		bind(xr_input.thumbstickClickAction, "/user/hand/right/input/right_stick/click");
+		bind(xr_input.buttonAXAction, "/user/hand/left/input/square/click");
+		bind(xr_input.buttonAXAction, "/user/hand/right/input/cross/click");
+		bind(xr_input.buttonAXTouchAction, "/user/hand/left/input/square/touch");
+		bind(xr_input.buttonAXTouchAction, "/user/hand/right/input/cross/touch");
+		bind(xr_input.buttonBYAction, "/user/hand/left/input/triangle/click");
+		bind(xr_input.buttonBYAction, "/user/hand/right/input/circle/click");
+		bind(xr_input.buttonBYTouchAction, "/user/hand/left/input/triangle/touch");
+		bind(xr_input.buttonBYTouchAction, "/user/hand/right/input/circle/touch");
+		bind(xr_input.menuClickAction, "/user/hand/right/input/options/click");
+
+		XrPath profile;
+		xrStringToPath(xr_instance, "/interaction_profiles/sony/playstation_vr2_sense_controller", &profile);
+		XrInteractionProfileSuggestedBinding suggested = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+		suggested.interactionProfile = profile;
+		suggested.suggestedBindings = bindings;
 		suggested.countSuggestedBindings = count;
 		xrSuggestInteractionProfileBindings(xr_instance, &suggested);
 	}
@@ -1147,11 +1265,31 @@ void openxr_input_init() {
 		xrSuggestInteractionProfileBindings(xr_instance, &suggested);
 	}
 
+	// Suggest bindings for XR_EXT_eye_gaze_interaction
+	if (app_has_eye_gaze && xr_input.gazeAction != XR_NULL_HANDLE) {
+		XrPath gaze_path;
+		xrStringToPath(xr_instance, "/user/eyes_ext/input/gaze_ext/pose", &gaze_path);
+		XrActionSuggestedBinding binding = { xr_input.gazeAction, gaze_path };
+
+		XrPath profile;
+		xrStringToPath(xr_instance, "/interaction_profiles/ext/eye_gaze_interaction", &profile);
+		XrInteractionProfileSuggestedBinding suggested = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+		suggested.interactionProfile     = profile;
+		suggested.suggestedBindings      = &binding;
+		suggested.countSuggestedBindings = 1;
+		xrSuggestInteractionProfileBindings(xr_instance, &suggested);
+	}
+
 	// Attach action set to session before xrBeginSession is called
 	XrSessionActionSetsAttachInfo attach = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
 	attach.countActionSets = 1;
 	attach.actionSets      = &xr_input.actionSet;
 	xrAttachSessionActionSets(xr_session, &attach);
+
+	// Log the active interaction profile for each hand at init time.
+	// Note: the runtime may not have selected a profile yet (XR_NULL_PATH is normal
+	// here before the first XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED event).
+	log_interaction_profiles();
 
 	// Create grip and aim spaces for each hand
 	for (int i = 0; i < 2; i++) {
@@ -1166,6 +1304,15 @@ void openxr_input_init() {
 		aim_info.subactionPath     = xr_input.handSubactionPath[i];
 		aim_info.poseInActionSpace = xr_pose_identity;
 		xrCreateActionSpace(xr_session, &aim_info, &xr_input.aimSpace[i]);
+	}
+
+	// Create eye gaze space (no subaction path)
+	if (app_has_eye_gaze && xr_input.gazeAction != XR_NULL_HANDLE) {
+		XrActionSpaceCreateInfo gaze_info = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
+		gaze_info.action            = xr_input.gazeAction;
+		gaze_info.subactionPath     = XR_NULL_PATH;
+		gaze_info.poseInActionSpace = xr_pose_identity;
+		xrCreateActionSpace(xr_session, &gaze_info, &xr_input.gazeSpace);
 	}
 }
 
@@ -1247,6 +1394,26 @@ void openxr_input_update(XrTime predictedTime) {
 		get_b(xr_input.buttonBYAction,        xr_input.buttonBY[hand]);
 		get_b(xr_input.buttonBYTouchAction,   xr_input.buttonBYTouched[hand]);
 		get_b(xr_input.menuClickAction,       xr_input.menu[hand]);
+	}
+
+	// Locate eye gaze pose (not hand-indexed; single source)
+	xr_input.gazeValid = false;
+	if (app_has_eye_gaze && xr_input.gazeSpace != XR_NULL_HANDLE) {
+		XrActionStatePose    gaze_s = { XR_TYPE_ACTION_STATE_POSE };
+		XrActionStateGetInfo gaze_i = { XR_TYPE_ACTION_STATE_GET_INFO };
+		gaze_i.action        = xr_input.gazeAction;
+		gaze_i.subactionPath = XR_NULL_PATH;
+		xrGetActionStatePose(xr_session, &gaze_i, &gaze_s);
+		if (gaze_s.isActive) {
+			XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
+			xrLocateSpace(xr_input.gazeSpace, xr_app_space, predictedTime, &loc);
+			bool pos_ok = (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)    != 0;
+			bool rot_ok = (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0;
+			if (pos_ok && rot_ok) {
+				xr_input.gazePose  = loc.pose;
+				xr_input.gazeValid = true;
+			}
+		}
 	}
 }
 
@@ -1434,7 +1601,7 @@ void app_init() {
 
 }
 
-void app_draw(XrCompositionLayerProjectionView& view) {
+void app_draw(XrCompositionLayerProjectionView& view, int view_index) {
 	static int frame_count = 0;
 	frame_count++;
 
@@ -1481,4 +1648,47 @@ void app_draw(XrCompositionLayerProjectionView& view) {
 
 	// Draw controllers and their input indicator panels
 	draw_controllers(mat_viewproj);
+
+	// Draw a small cyan cube at 2m in the gaze direction (eye tracking cursor)
+	if (xr_input.gazeValid) {
+		XMVECTOR gaze_pos = XMLoadFloat3((XMFLOAT3*)&xr_input.gazePose.position);
+		XMVECTOR gaze_rot = XMLoadFloat4((XMFLOAT4*)&xr_input.gazePose.orientation);
+		XMMATRIX gaze_to_world = XMMatrixAffineTransformation(g_XMOne, g_XMZero, gaze_rot, gaze_pos);
+		draw_box(XMMatrixScaling(0.02f, 0.02f, 0.02f) * XMMatrixTranslation(0, 0, -2.0f) * gaze_to_world,
+		         mat_viewproj, 0.0f, 1.0f, 0.9f); // cyan
+	}
+
+	// Draw a gold wireframe frame showing the foveal (high-res) region boundary
+	// in wide views (0 and 1) when XR_VARJO_quad_views is active.
+	if (view_index >= 0 && view_index < 2 && app_has_quad_views && (int)xr_views.size() >= 4) {
+		const XrFovf& fov = xr_views[view_index + 2].fov;
+		const float D  = 2.0f; // distance in meters
+
+		float L  = tanf(fov.angleLeft)  * D;
+		float R  = tanf(fov.angleRight) * D;
+		float U  = tanf(fov.angleUp)    * D;
+		float Lo = tanf(fov.angleDown)  * D;
+
+		float cx = (L + R) * 0.5f;
+		float cy = (U + Lo) * 0.5f;
+		float fw = R - L;
+		float fh = U - Lo;
+		const float T = 0.003f; // border thickness (meters)
+
+		// Camera-to-world transform (inverse of view matrix)
+		XMMATRIX cam_to_world = XMMatrixAffineTransformation(
+			g_XMOne, g_XMZero,
+			XMLoadFloat4((XMFLOAT4*)&view.pose.orientation),
+			XMLoadFloat3((XMFLOAT3*)&view.pose.position));
+
+		auto fov_bar = [&](float lx, float ly, float sw, float sh) {
+			draw_box(XMMatrixScaling(sw, sh, 0.001f) * XMMatrixTranslation(lx, ly, -D) * cam_to_world,
+			         mat_viewproj, 1.0f, 0.85f, 0.0f); // gold
+		};
+
+		fov_bar(cx,           U  - T * 0.5f, fw, T); // top
+		fov_bar(cx,           Lo + T * 0.5f, fw, T); // bottom
+		fov_bar(L  + T * 0.5f, cy,           T, fh); // left
+		fov_bar(R  - T * 0.5f, cy,           T, fh); // right
+	}
 }
